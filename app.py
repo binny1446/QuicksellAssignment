@@ -1,177 +1,238 @@
-import os
-from PyPDF2 import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+#writefile app.py
 import streamlit as st
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from langgraph.graph import StateGraph
+from sentence_transformers import SentenceTransformer
+import faiss
+from langchain_google_genai import GoogleGenerativeAI
 import google.generativeai as genai
-from langchain.vectorstores import FAISS
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains import ConversationalRetrievalChain
+from typing import Annotated
+from typing_extensions import TypedDict
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
 
-from dotenv import load_dotenv
-from langchain.memory import ConversationBufferMemory
-from langchain_core.output_parsers import StrOutputParser
-from langchain.load import dumps, loads
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
+memory = MemorySaver()
 
-from typing import List
-from langchain.schema import Document
-import uuid
+# Configure Gemini API
+genai.configure(api_key="AIzaSyC2nRjklHRNgND98qIvCV7KNsmHLBI9yA4")
+llm2 = genai.GenerativeModel('gemini-pro')
+llm = GoogleGenerativeAI(model="gemini-pro")
 
-from langchain_core.documents import Document
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+# Step 1: Load and encode the FAQ data using SentenceTransformer
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
+# Example FAQs (replace with your own set)
+faqs = [
+    {"question": "What is the return policy?", "answer": "To return a product, log in to your account, select 'Orders', and click on 'Return'."},
+    {"question": "How do I track my order?", "answer": "To track your order, go to 'My Orders' and select 'Track Order'."},
+    # Add more FAQs here...
+]
 
-load_dotenv()
-os.getenv("GOOGLE_API_KEY")
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+# Encode FAQ questions
+faq_questions = [faq["question"] for faq in faqs]
+faq_embeddings = model.encode(faq_questions)
 
-def get_pdf_text(pdf_docs):
-    text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-    return text
+# Build FAISS index for FAQ retrieval
+dimension = faq_embeddings.shape[1]
+index = faiss.IndexFlatL2(dimension)
+index.add(faq_embeddings)
 
-def get_text_chunks(text):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=8000, chunk_overlap=800)
-    chunks = splitter.split_text(text)
-    return chunks
+# Function to retrieve relevant FAQ based on a query
+def retrieve_faq(query, top_k=1):
+    query_embedding = model.encode([query])
+    distances, indices = index.search(query_embedding, top_k)
+    return faqs[indices[0][0]]['answer']  # Return the answer of the retrieved FAQ
 
+# Step 2: Define tools for intent classification, NER, and FAQ handling
+# Intent Classification Tool
+intent_prompt = PromptTemplate(
+    input_variables=["user_input"],
+    template=(
+        "Classify the intent of the following sentence into one of these categories: "
+        "1. Product search, 2. FAQ inquiry, 3. Order tracking, 4. General chat. "
+        "The sentence is: {user_input}"
+    ),
+)
+intent_chain = LLMChain(llm=llm, prompt=intent_prompt)
 
-def get_vector_store(chunks):
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001")
-    vector_store = FAISS.from_texts(chunks, embedding=embeddings)
-    vector_store.save_local("faiss_index")
+def classify_intent(user_input):
+    response = intent_chain.run(user_input)
+    # Extract the intent from the response (e.g., "Product search")
+    if "Product search" in response:
+        return "Product search"
+    elif "FAQ inquiry" in response:
+        return "FAQ inquiry"
+    elif "Order tracking" in response:
+        return "Order tracking"
+    elif "General chat" in response:
+        return "General chat"
+    else:
+        return "General chat"  # Default to general chat
 
- # Correct LLM import for Google Generative AI
+# Named Entity Recognition (NER) Tool
+ner_prompt = PromptTemplate(
+    input_variables=["user_input"],
+    template=(
+        "Perform named entity recognition on the following e-commerce sentence: {user_input}. "
+        "Extract entities like product names, locations, and stores."
+    ),
+)
+ner_chain = LLMChain(llm=llm, prompt=ner_prompt)
 
-def get_conversational_chain():
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    vectordb = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-    
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        output_key='answer'
-    )
+def perform_ner(user_input):
+    return ner_chain.run(user_input)
 
-    prompt_template = """
-    Use the following conversation history and context to answer the question. If the answer is not in the context and history, 
-    just say "Sorry, I didn't understand your question. Do you want to connect with live agent?". Make sure to provide detailed answers when possible.
+# FAQ Inquiry Tool (RAG tool)
+faq_prompt = PromptTemplate(
+    input_variables=["retrieved_faq", "user_input"],
+    template=(
+        "Here is an FAQ relevant to the user's query: {retrieved_faq}. "
+        "Explain this FAQ in more detail to the customer based on their input: {user_input}."
+    ),
+)
+faq_chain = LLMChain(llm=llm, prompt=faq_prompt)
 
-    Chat History: {chat_history}
-    Context: {context}
-    Question: {question}
+def handle_faq(user_input, retrieved_faq):
+    return faq_chain.run({"user_input": user_input, "retrieved_faq": retrieved_faq})
 
-    Answer:
-    """
+# Define the state
+class State(TypedDict):
+    user_input: str
+    intent: str
+    ner_result: str
+    retrieved_faq: str
+    response: str
+    messages: Annotated[list, add_messages]
 
-    llm = ChatGoogleGenerativeAI(model="models/gemini-1.5-flash", temperature=0.3)
-    
-    qa_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectordb.as_retriever(),
-        memory=memory,
-        return_source_documents=True,
-        combine_docs_chain_kwargs={
-            'prompt': PromptTemplate(
-                template=prompt_template,
-                input_variables=["context", "chat_history", "question"]
-            )
-        }
-    )
-    
-    return qa_chain
+# Add nodes
+def intent_classification(state: State) -> State:
+    intent = classify_intent(state["messages"][-1])
+    return {"intent": intent}
 
-def clear_chat_history():
-    st.session_state.messages = [
-        {"role": "assistant", "content": "Upload some PDFs and ask me a question"}
-    ]
-    if 'chat_history' in st.session_state:
-        del st.session_state['chat_history']
+def ner_product_search(state: State) -> State:
+    ner_result = perform_ner(state["messages"][-1])
+    return {"ner_result": ner_result}
 
-def user_input(user_question):
-    chain = get_conversational_chain()
+def llm_product_search(state: State) -> State:
+    response = llm2.generate_content(f"Search products related to: {state['ner_result'][-1]}").text
+    return {"response": response}
 
-    response = chain({"question": user_question})
-    return response['answer']
+def general_chat(state: State) -> State:
+    string = " "
+    for i in range(len(state["messages"])-1):
+        string += str(state["messages"][i])
 
-def multi(chunks):
-    llm = ChatGoogleGenerativeAI(model="models/gemini-1.5-flash", temperature=0.3)
-    chain = ({"doc": lambda x: x.page_content} | ChatPromptTemplate.from_template("Summarize the following document:\n\n{doc}") | llm | StrOutputParser())
+    string += "Only this part is the current question being asked before other than this statement everything is memory hence only answer this question:"
+    string += str(state["messages"][-1])
+    response = llm2.generate_content(string).text
 
-    summaries = chain.batch(chunks, {"max_concurrency": 5})
-    vectorstore = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+    return {"response": response}
 
-    # The storage layer for the parent documents
-    store = InMemoryByteStore()
-    id_key = "doc_id"
-    
-    # The retriever
-    retriever = MultiVectorRetriever(vectorstore=vectorstore,  byte_store=store,  id_key=id_key)
-    doc_ids = [str(uuid.uuid4()) for _ in chunks]
-    
-    # Docs linked to summaries
-    summary_docs = [Document(page_content=s, metadata={id_key: doc_ids[i]})  for i, s in enumerate(summaries)]
-    
-    # Add
-    retriever.vectorstore.add_documents(summary_docs)
-    retriever.docstore.mset(list(zip(doc_ids, chunks)))
-    
+def faq_inquiry(state: State) -> State:
+    retrieved_faq = retrieve_faq(state["messages"][-1])
+    return {"retrieved_faq": retrieved_faq}
 
-def main():
-    st.set_page_config(
-        page_title="Gemini PDF Chatbot with Memory",
-        page_icon="🤖"
-    )
+def faq_answer(state: State) -> State:
+    response = handle_faq(state["messages"][-1], state["retrieved_faq"][-1])
+    return {"response": response}
 
-    with st.sidebar:
-        st.title("Menu:")
-        pdf_docs = st.file_uploader(
-            "Upload your PDF Files and Click on the Submit & Process Button",
-            accept_multiple_files=True
-        )
-        if st.button("Submit & Process"):
-            with st.spinner("Processing..."):
-                raw_text = get_pdf_text(pdf_docs)
-                text_chunks = get_text_chunks(raw_text)
-                get_vector_store(text_chunks)
-                st.success("Done")
+def ner_order_tracking(state: State) -> State:
+    ner_result = perform_ner(state["messages"][-1])
+    return {"ner_result": ner_result}
 
-    st.title("Chat with PDF files using Gemini🤖")
-    st.write("Welcome to the chat!")
-    st.sidebar.button('Clear Chat History', on_click=clear_chat_history)
+def llm_order_tracking(state: State) -> State:
+    response = llm2.generate_content(f"Track order with the following details: {state['ner_result'][-1]}").text
+    return {"response": response}
 
-    if "messages" not in st.session_state:
-        st.session_state.messages = [
-            {"role": "assistant", "content": "Upload some PDFs and ask me a question"}
-        ]
+def end(state: State) -> State:
+    return {"response": "Goodbye!"}
+
+# Initialize the graph
+graph = StateGraph(State)
+
+# Add nodes to the graph
+graph.add_node("INTENT_CLASSIFICATION", intent_classification)
+graph.add_node("NER_PRODUCT_SEARCH", ner_product_search)
+graph.add_node("LLM_PRODUCT_SEARCH", llm_product_search)
+graph.add_node("GENERAL_CHAT", general_chat)
+graph.add_node("FAQ_INQUIRY", faq_inquiry)
+graph.add_node("FAQ_ANSWER", faq_answer)
+graph.add_node("NER_ORDER_TRACKING", ner_order_tracking)
+graph.add_node("LLM_ORDER_TRACKING", llm_order_tracking)
+graph.add_node("END", end)
+
+# Add edges
+graph.add_conditional_edges(
+    source="INTENT_CLASSIFICATION",
+    path=lambda state: state["intent"],
+    path_map={
+        "Product search": "NER_PRODUCT_SEARCH",
+        "General chat": "GENERAL_CHAT",
+        "FAQ inquiry": "FAQ_INQUIRY",
+        "Order tracking": "NER_ORDER_TRACKING"
+    }
+)
+
+graph.add_edge("NER_PRODUCT_SEARCH", "LLM_PRODUCT_SEARCH")
+graph.add_edge("LLM_PRODUCT_SEARCH", "END")
+
+graph.add_edge("GENERAL_CHAT", "END")
+
+graph.add_edge("FAQ_INQUIRY", "FAQ_ANSWER")
+graph.add_edge("FAQ_ANSWER", "END")
+
+graph.add_edge("NER_ORDER_TRACKING", "LLM_ORDER_TRACKING")
+graph.add_edge("LLM_ORDER_TRACKING", "END")
+
+# Set the entry point
+graph.set_entry_point("INTENT_CLASSIFICATION")
+
+# Compile the graph
+graph = graph.compile(checkpointer=memory)
+
+# Step 4: Define the chatbot agent with memory and continuous interaction
+def chatbot_agent():
+    config = {"configurable": {"thread_id": "1"}}
+    st.session_state.messages = st.session_state.get("messages", [])
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            st.write(message["content"])
+            st.markdown(message["content"])
 
-    if prompt := st.chat_input():
+    if prompt := st.chat_input("You: "):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
-            st.write(prompt)
+            st.markdown(prompt)
 
-        if st.session_state.messages[-1]["role"] != "assistant":
+        if prompt.lower() in ["exit", "quit"]:
+            st.session_state.messages.append({"role": "assistant", "content": "Goodbye!"})
             with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    response = user_input(prompt)
-                    placeholder = st.empty()
-                    placeholder.markdown(response)
-            
-            message = {"role": "assistant", "content": response}
-            st.session_state.messages.append(message)
+                st.markdown("Goodbye!")
+            return
 
-if __name__ == "__main__":
-    main()
+        # The config is the **second positional argument** to stream() or invoke()!
+        events = graph.stream(
+            {"messages": [{"role": "user", "content": prompt}]},
+            config,
+            stream_mode="values",
+        )
+        for event in events:
+            if "messages" in event:
+                response = event["messages"][-1]
+            if "response" in event:
+                response = event["response"]
+
+        st.session_state.messages.append({"role": "assistant", "content": response})
+        with st.chat_message("assistant"):
+            st.markdown(response)
+
+# Streamlit UI
+st.title("Chatbot Interface")
+
+# Initialize session state for messages
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Run the chatbot agent
+chatbot_agent()
